@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { resolveClaudeConfigDir } from "@nimbalyst/runtime/ai/server/providers/claudeCode/claudeConfigDir";
+import { logger } from "../../utils/logger";
 import {
   encodeWorkspaceDir,
   type ClaudeCodeEntry,
@@ -43,6 +44,28 @@ export class ClaudeCodeSource implements ExternalSessionSource {
   private readonly discovery = new BoundedDiscovery();
   private readonly headers = new AcceptedHeaderCache();
   private readonly titles = new Map<string, ClaudeTitleState>();
+  // Set only while a manual scan runs, so the live watcher stays quiet.
+  private tracing = false;
+  private skipped: Record<string, number> = {};
+
+  private skip(
+    reason: string,
+    file: string,
+    workspacePath: string | undefined,
+    folder?: string,
+    cwd?: unknown
+  ): null {
+    if (!this.tracing) return null;
+    this.skipped[reason] = (this.skipped[reason] ?? 0) + 1;
+    const expected =
+      typeof cwd === "string" && path.isAbsolute(cwd)
+        ? encodeWorkspaceDir(cwd)
+        : undefined;
+    logger.aiClaudeCode.info(
+      `[ExternalSessions] skip provider=claude-code file=${file} reason=${reason} folder=${folder} expected=${expected} cwd=${cwd} workspace=${workspacePath}`
+    );
+    return null;
+  }
 
   private updateTitle(
     file: string,
@@ -165,28 +188,39 @@ export class ClaudeCodeSource implements ExternalSessionSource {
       }
     );
     const sessions: ExternalSessionRef[] = [];
-    for (const file of page.paths) {
-      try {
-        if (skipUnchanged) {
-          // Titles live in the log itself, so an unchanged stamp means nothing new.
-          const stat = await fs.stat(file);
-          if (
-            skipUnchanged(file, {
-              inode: stat.ino,
-              size: stat.size,
-              mtimeMs: stat.mtimeMs,
-            })
-          )
-            continue;
+    this.tracing = manual;
+    this.skipped = {};
+    try {
+      for (const file of page.paths) {
+        try {
+          if (skipUnchanged) {
+            // Titles live in the log itself, so an unchanged stamp means nothing new.
+            const stat = await fs.stat(file);
+            if (
+              skipUnchanged(file, {
+                inode: stat.ino,
+                size: stat.size,
+                mtimeMs: stat.mtimeMs,
+              })
+            )
+              continue;
+          }
+          const ref = await this.inspect(file, workspacePath, {
+            includeFinalLine: manual,
+          });
+          if (ref) sessions.push(ref);
+        } catch (error: any) {
+          if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR")
+            throw error;
         }
-        const ref = await this.inspect(file, workspacePath, {
-          includeFinalLine: manual,
-        });
-        if (ref) sessions.push(ref);
-      } catch (error: any) {
-        if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
       }
+    } finally {
+      this.tracing = false;
     }
+    if (manual)
+      logger.aiClaudeCode.info(
+        `[ExternalSessions] scan root=${root} files=${page.paths.length} accepted=${sessions.length} skipped=${JSON.stringify(this.skipped)}`
+      );
     return { sessions, hasMore: page.hasMore };
   }
 
@@ -195,7 +229,8 @@ export class ClaudeCodeSource implements ExternalSessionSource {
     workspacePath?: string,
     readOptions: ExternalReadOptions = {}
   ): Promise<ExternalSessionRef | null> {
-    if (!path.isAbsolute(filePath)) return null;
+    if (!path.isAbsolute(filePath))
+      return this.skip("not-absolute", filePath, workspacePath);
     const parts = path.relative(this.root, filePath).split(path.sep);
     const workspaceDir = parts.shift();
     if (
@@ -203,7 +238,12 @@ export class ClaudeCodeSource implements ExternalSessionSource {
       (workspacePath !== undefined &&
         workspaceDir !== encodeWorkspaceDir(workspacePath))
     )
-      return null;
+      return this.skip(
+        "folder-not-workspace",
+        filePath,
+        workspacePath,
+        workspaceDir
+      );
     const workspaceRoot = path.join(this.root, workspaceDir);
     let externalId: string;
     let parentToolUseId: string | undefined;
@@ -220,8 +260,15 @@ export class ClaudeCodeSource implements ExternalSessionSource {
     ) {
       externalId = parts[0];
       parentToolUseId = parts[2].slice(6, -6);
-    } else return null;
-    if (!externalId || externalId === "." || externalId === "..") return null;
+    } else
+      return this.skip(
+        "not-session-file",
+        filePath,
+        workspacePath,
+        workspaceDir
+      );
+    if (!externalId || externalId === "." || externalId === "..")
+      return this.skip("bad-id", filePath, workspacePath, workspaceDir);
     // A sidecar may omit cwd entirely. Its physical parent log is the only
     // authority for inheritance; the encoded directory is never decoded.
     const parent = parentToolUseId
@@ -231,7 +278,8 @@ export class ClaudeCodeSource implements ExternalSessionSource {
           readOptions
         )
       : null;
-    if (parentToolUseId && !parent) return null;
+    if (parentToolUseId && !parent)
+      return this.skip("parent-rejected", filePath, workspacePath, workspaceDir);
     const cached = await this.headers.get(this.root, filePath, workspacePath);
     if (
       cached &&
@@ -256,7 +304,13 @@ export class ClaudeCodeSource implements ExternalSessionSource {
               : e.isSidechain === true)
         )
       )
-        return null;
+        return this.skip(
+          "cached-delta-invalid",
+          filePath,
+          workspacePath,
+          workspaceDir,
+          cached.workspacePath
+        );
       cached.title = parentToolUseId
         ? undefined
         : this.updateTitle(
@@ -274,7 +328,7 @@ export class ClaudeCodeSource implements ExternalSessionSource {
       await validateSourcePath(this.root, filePath);
     } catch (error: any) {
       if (error?.code === "ENOENT") throw error;
-      return null;
+      return this.skip("path-validation", filePath, workspacePath, workspaceDir);
     }
     const head = await readJsonl(filePath, null, {
       ...this.options,
@@ -292,30 +346,30 @@ export class ClaudeCodeSource implements ExternalSessionSource {
     const cwd = parent
       ? parent.workspacePath
       : entries.find((e) => e.cwd !== undefined)?.cwd;
-    if (
-      typeof cwd !== "string" ||
-      !path.isAbsolute(cwd) ||
-      workspaceDir !== encodeWorkspaceDir(cwd)
-    )
-      return null;
+    const skip = (reason: string) =>
+      this.skip(reason, filePath, workspacePath, workspaceDir, cwd);
+    if (typeof cwd !== "string" || !path.isAbsolute(cwd))
+      return skip("no-launch-cwd");
+    if (workspaceDir !== encodeWorkspaceDir(cwd))
+      return skip("cwd-folder-mismatch");
     if (workspacePath !== undefined && !validWorkspace(cwd, workspacePath))
-      return null;
-    if (entries.some((e) => !recordedCwd(e.cwd))) return null;
+      return skip("cwd-not-workspace");
+    if (entries.some((e) => !recordedCwd(e.cwd))) return skip("malformed-cwd");
     if (
       entries.some(
         (e) => e.sessionId !== undefined && e.sessionId !== externalId
       )
     )
-      return null;
+      return skip("session-id-changed");
     if (
       parentToolUseId &&
       entries.some(
         (e) => e.agentId !== undefined && e.agentId !== parentToolUseId
       )
     )
-      return null;
+      return skip("sidecar-identity");
     if (!parentToolUseId && entries.some((e) => e.isSidechain === true))
-      return null;
+      return skip("sidechain");
     const stat = await fs.stat(filePath);
     const title = parentToolUseId
       ? undefined
