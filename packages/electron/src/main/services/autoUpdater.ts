@@ -33,6 +33,9 @@ export { classifyUpdateError, categorizeDownloadDuration, isWindowsRenameLockErr
 
 // Reminder suppression duration: 24 hours
 const REMINDER_SUPPRESSION_DURATION_MS = 24 * 60 * 60 * 1000;
+// Personal fork build: never check for or install upstream releases, which
+// would replace this build. Sync by rebasing the fork and rebuilding instead.
+const UPDATES_DISABLED = true;
 const GITHUB_UPDATE_PROVIDER = {
   provider: 'github' as const,
   owner: 'nimbalyst',
@@ -419,6 +422,9 @@ export class AutoUpdaterService {
 
   private setupIpcHandlers() {
     safeHandle('check-for-updates', async () => {
+      if (UPDATES_DISABLED) {
+        return null;
+      }
       if (this.isCheckingForUpdate) {
         return { checking: true };
       }
@@ -582,6 +588,10 @@ export class AutoUpdaterService {
   }
 
   public startAutoUpdateCheck(intervalMinutes = 60) {
+    if (UPDATES_DISABLED) {
+      log.info('Auto-update disabled in this build');
+      return;
+    }
     // Initial check after 30 seconds
     setTimeout(() => {
       this.checkForUpdates();
@@ -605,6 +615,9 @@ export class AutoUpdaterService {
   }
 
   public async checkForUpdates() {
+    if (UPDATES_DISABLED) {
+      return;
+    }
     if (this.isCheckingForUpdate) {
       log.info('Already checking for updates, skipping...');
       return;
@@ -621,6 +634,13 @@ export class AutoUpdaterService {
   public async checkForUpdatesWithUI() {
     if (this.isCheckingForUpdate) {
       // Already checking, don't show anything - the checking toast is already visible
+      return;
+    }
+
+    if (UPDATES_DISABLED) {
+      this.sendToFrontmostWindow('update-toast:error', {
+        message: 'Updates are disabled in this personal build'
+      });
       return;
     }
 
