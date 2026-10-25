@@ -248,7 +248,8 @@ test('npx runs the published CLI even in a project that has its own @nimbalyst/c
     const args = JSON.parse(configs.get('.mcp.json')).mcpServers['nimbalyst-session'].args
       .map((arg) => (arg === cliSpec() ? `@nimbalyst/cli@${version}` : arg));
     // --offline: the fake version is in no registry, so npx fails unless it picks the project's copy.
-    const run = spawnSync('npx', ['--offline', ...args], { cwd: project, encoding: 'utf8', input: '' });
+    // Windows ships npx as npx.cmd, which only a shell resolves.
+    const run = spawnSync('npx', ['--offline', ...args], { cwd: project, encoding: 'utf8', input: '', shell: process.platform === 'win32' });
     assert.doesNotMatch(run.stdout, /LOCAL COPY/);
   } finally {
     rmSync(project, { recursive: true, force: true });
