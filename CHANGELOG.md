@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Importing Claude Code and Codex sessions on Windows no longer fails with "Invalid external session cursor" for log files with large NTFS file IDs.
 
 ### Removed
 <!-- Removed features go here -->

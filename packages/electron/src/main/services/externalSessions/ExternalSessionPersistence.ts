@@ -112,7 +112,8 @@ function encodeCursor(cursor: ExternalCursor): string {
 function normalizeCursor(cursor: ExternalCursor): ExternalCursor {
   if (!Number.isSafeInteger(cursor.byteOffset) || cursor.byteOffset < 0 ||
       !Number.isSafeInteger(cursor.fileSize) || cursor.fileSize < cursor.byteOffset ||
-      (cursor.inode !== null && (!Number.isSafeInteger(cursor.inode) || cursor.inode < 0)) ||
+      // NTFS file IDs exceed 2^53; Node rounds them consistently, so any finite integer is a valid identity.
+      (cursor.inode !== null && (!Number.isInteger(cursor.inode) || cursor.inode < 0)) ||
       (cursor.lastEntryUuid !== null && typeof cursor.lastEntryUuid !== 'string')) {
     throw new Error('Invalid external session cursor');
   }
