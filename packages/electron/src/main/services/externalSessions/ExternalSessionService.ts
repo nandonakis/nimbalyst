@@ -33,6 +33,9 @@ import type {
 } from "../../../shared/externalSessions";
 
 const FOLLOW_KEY = "app.externalSessionFollowEnabled";
+/** Manual scan/sync tracing; the live watcher never calls this. */
+const trace = (message: string) =>
+  logger.aiClaudeCode.info(`[ExternalSessions] ${message}`);
 interface Dependencies {
   settings: {
     get: (key: typeof FOLLOW_KEY) => unknown;
@@ -123,8 +126,16 @@ export class ExternalSessionService {
         .createSources()
         .filter((source) => !providerId || source.providerId === providerId);
       try {
+        trace(
+          `scan start workspace=${workspacePath} provider=${providerId ?? "*"}`
+        );
         const refs = await this.discoverManual(sources, workspacePath);
         const routes = await this.deps.getRoutes();
+        trace(
+          `scan refs=${refs.length} routes=${JSON.stringify(
+            routes.map((route) => route.cwd)
+          )}`
+        );
         const summaries: ExternalSessionSummary[] = [];
         for (const ref of refs.filter((ref) => !ref.parentToolUseId)) {
           if (this.stopped) throw new Error("External session service stopped");
@@ -133,6 +144,9 @@ export class ExternalSessionService {
             route = resolveExternalRoute(ref.workspacePath, routes);
           } catch {
             // One multiply-owned worktree must not hide other selectable sessions.
+            trace(
+              `skip provider=${ref.providerId} file=${ref.filePath} reason=route-ambiguous cwd=${ref.workspacePath}`
+            );
             continue;
           }
           const localId = await this.deps.persistence.resolveSessionId({
@@ -156,6 +170,14 @@ export class ExternalSessionService {
               : "up-to-date",
           });
         }
+        const byStatus: Record<string, number> = {};
+        for (const summary of summaries)
+          byStatus[summary.syncStatus] = (byStatus[summary.syncStatus] ?? 0) + 1;
+        trace(
+          `scan done sessions=${summaries.length} status=${JSON.stringify(
+            byStatus
+          )}`
+        );
         return summaries;
       } finally {
         await Promise.all(sources.map((source) => source.dispose()));
@@ -225,11 +247,25 @@ export class ExternalSessionService {
             }
             results.push({ ...selection, success: true, messagesAdded });
           } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            // Same-id refs expose near misses, such as a cwd differing only in case.
+            const sameId = refs
+              .filter((ref) => ref.externalId === selection.sessionId)
+              .map((ref) => ({
+                workspacePath: ref.workspacePath,
+                filePath: ref.filePath,
+              }));
+            trace(
+              `sync failed selection=${JSON.stringify(
+                selection
+              )} error=${message} sameId=${JSON.stringify(sameId)}`
+            );
             results.push({
               ...selection,
               success: false,
               messagesAdded,
-              error: error instanceof Error ? error.message : String(error),
+              error: message,
             });
           }
         }

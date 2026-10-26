@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { logger } from "../../utils/logger";
 import {
   BoundedDiscovery,
   AcceptedHeaderCache,
@@ -43,6 +44,23 @@ export class CodexSource implements ExternalSessionSource {
   >();
 
   private readonly pendingIndexRefs = new WeakSet<ExternalSessionRef>();
+  // Set only while a manual scan runs, so the live watcher stays quiet.
+  private tracing = false;
+  private skipped: Record<string, number> = {};
+
+  private skip(
+    reason: string,
+    file: string,
+    workspacePath: string | undefined,
+    cwd?: unknown
+  ): null {
+    if (!this.tracing) return null;
+    this.skipped[reason] = (this.skipped[reason] ?? 0) + 1;
+    logger.aiClaudeCode.info(
+      `[ExternalSessions] skip provider=openai-codex file=${file} reason=${reason} cwd=${cwd} workspace=${workspacePath}`
+    );
+    return null;
+  }
 
   private async withIndexTitle(
     ref: ExternalSessionRef
@@ -205,16 +223,27 @@ export class CodexSource implements ExternalSessionSource {
       (relative) => /^\d{4}(?:[/\\]\d{2}){0,2}$/.test(relative)
     );
     const sessions: ExternalSessionRef[] = [];
-    for (const file of page.paths) {
-      try {
-        const ref = await this.inspect(file, workspacePath, {
-          includeFinalLine: manual,
-        });
-        if (ref) sessions.push(ref);
-      } catch (error: any) {
-        if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    this.tracing = manual;
+    this.skipped = {};
+    try {
+      for (const file of page.paths) {
+        try {
+          const ref = await this.inspect(file, workspacePath, {
+            includeFinalLine: manual,
+          });
+          if (ref) sessions.push(ref);
+        } catch (error: any) {
+          if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR")
+            throw error;
+        }
       }
+    } finally {
+      this.tracing = false;
     }
+    if (manual)
+      logger.aiClaudeCode.info(
+        `[ExternalSessions] scan root=${this.root} files=${page.paths.length} accepted=${sessions.length} skipped=${JSON.stringify(this.skipped)}`
+      );
     return { sessions, hasMore: page.hasMore };
   }
 
@@ -228,7 +257,7 @@ export class CodexSource implements ExternalSessionSource {
         path.relative(this.root, filePath)
       )
     )
-      return null;
+      return this.skip("not-rollout-name", filePath, workspacePath);
     const cached = await this.headers.get(this.root, filePath, workspacePath);
     if (cached) {
       const scan = this.titleScans.get(filePath);
@@ -254,7 +283,7 @@ export class CodexSource implements ExternalSessionSource {
       await validateSourcePath(this.root, filePath);
     } catch (error: any) {
       if (error?.code === "ENOENT") throw error;
-      return null;
+      return this.skip("path-validation", filePath, workspacePath);
     }
     const stat = await fs.stat(filePath);
     const cacheKey = `${
@@ -273,7 +302,7 @@ export class CodexSource implements ExternalSessionSource {
         size: stat.size,
         mtimeMs: stat.mtimeMs,
       });
-      return null;
+      return this.skip("foreign-cached", filePath, workspacePath);
     }
     this.foreignHeaders.delete(cacheKey);
     const head = await readJsonl(filePath, null, {
@@ -287,12 +316,12 @@ export class CodexSource implements ExternalSessionSource {
       typeof meta.payload?.id !== "string" ||
       !meta.payload.id
     )
-      return null;
+      return this.skip("no-session-meta", filePath, workspacePath);
     if (
       typeof meta.payload.cwd !== "string" ||
       !path.isAbsolute(meta.payload.cwd)
     )
-      return null;
+      return this.skip("no-cwd", filePath, workspacePath, meta.payload.cwd);
     // Subagent threads (auto-review guardians, spawned agents) are internal to
     // their parent session, not sessions the user started. Cache them as
     // foreign so appends do not reread the header.
@@ -318,7 +347,12 @@ export class CodexSource implements ExternalSessionSource {
         if (this.foreignHeaders.size > 512)
           this.foreignHeaders.delete(this.foreignHeaders.keys().next().value!);
       }
-      return null;
+      return this.skip(
+        subagent ? "subagent" : "cwd-not-workspace",
+        filePath,
+        workspacePath,
+        meta.payload.cwd
+      );
     }
     const ref: ExternalSessionRef = {
       providerId: this.providerId,
