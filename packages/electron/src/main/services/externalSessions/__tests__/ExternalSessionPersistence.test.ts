@@ -144,6 +144,21 @@ describe.each(['pglite', 'sqlite'] as const)('ExternalSessionPersistence (%s)', 
     await expect(persistence.getCursor(ref)).rejects.toThrow(/marker/i);
   });
 
+  it('round-trips NTFS file IDs above 2^53 across restart and still rejects malformed inodes', async () => {
+    // Node reports large NTFS file IDs as rounded doubles; the same file always rounds the same way.
+    const large = { ...cursor(100), inode: 122160139892945600 };
+    expect(Number.isSafeInteger(large.inode)).toBe(false);
+    await append(null, large, ['a']);
+    await db.close();
+    await open();
+    expect(await persistence.getCursor(ref)).toEqual(large);
+    await append(large, { ...large, byteOffset: 200, fileSize: 200 }, ['b']);
+    for (const inode of [-1, 1.5, Number.POSITIVE_INFINITY, Number.NaN, '1' as unknown as number]) {
+      await expect(append(null, { ...cursor(300), inode }, ['invalid'], { ...ref, filePath: '/logs/other.jsonl' })).rejects.toThrow(/cursor/i);
+    }
+    expect(await ids()).toEqual(['a', 'b']);
+  });
+
   it('rolls back a mid-batch failure and permits retry without losing the cursor or duplicating rows', async () => {
     await append(null, cursor(100), ['a']);
     await expect(persistence.appendAndAdvance({ ref, sessionId: 'local', expectedCursor: cursor(100), cursor: cursor(200), messages: [message('b'), { ...message('invalid'), direction: 'invalid' as 'output' }] })).rejects.toThrow();
