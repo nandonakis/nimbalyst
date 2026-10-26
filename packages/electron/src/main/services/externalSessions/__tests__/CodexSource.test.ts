@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CodexSource } from "../CodexSource";
 import * as reader from "../jsonlReader";
+import { logger } from "../../../utils/logger";
 import { CodexRawParserDispatcher } from "@nimbalyst/runtime/ai/server/transcript/parsers/CodexRawParserDispatcher";
 import type { ParseContext } from "@nimbalyst/runtime/ai/server/transcript/parsers/IRawMessageParser";
 vi.mock("node:fs/promises", { spy: true });
@@ -317,6 +318,22 @@ it("skips subagent rollouts such as auto-review guardian threads without rereadi
       null
     )
   ).rejects.toThrow();
+});
+it("logs per-file skip reasons and a summary only for manual scans", async () => {
+  const file = path.join(dir, "2026/09/14/rollout-elsewhere.jsonl");
+  await fs.writeFile(
+    file,
+    JSON.stringify({ type: "session_meta", payload: { id: "elsewhere", cwd: "/other" } }) + "\n"
+  );
+  const info = vi.spyOn(logger.aiClaudeCode, "info").mockImplementation(() => {});
+  expect((await source.discoverPage(cwd)).sessions).toEqual([]);
+  const lines = info.mock.calls.map(([line]) => String(line));
+  expect(lines).toContainEqual(expect.stringMatching(/skip provider=openai-codex file=.*rollout-elsewhere\.jsonl reason=cwd-not-workspace cwd=\/other/));
+  expect(lines).toContainEqual(expect.stringMatching(/scan root=.* files=1 accepted=0 skipped=\{"cwd-not-workspace":1\}/));
+  // The live watcher rescans constantly, so it must stay silent.
+  info.mockClear();
+  expect(await source.discover(cwd)).toEqual([]);
+  expect(info).not.toHaveBeenCalled();
 });
 it("maps current ordinal rollouts to the same canonical command/file/MCP output as live app-server items", async () => {
   await source.dispose();
